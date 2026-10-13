@@ -1,3 +1,4 @@
+
 const form = document.querySelector('#project-form');
 const nameInput = document.querySelector('#name');
 const statusInput = document.querySelector('#status');
@@ -14,11 +15,23 @@ const validStatuses = ['Planned', 'In Progress', 'Completed'];
 let projects = [];
 let editingId = null;
 let submitting = false;
+let deleting = false;
+let loading = false;
+let loadFailed = false;
 
-// Send a request to the server and handle API errors.
+// Keep all mutation controls consistent while a request is pending.
+function setMutationControlsDisabled(disabled) {
+  saveButton.disabled = disabled;
+  cancelButton.disabled = disabled;
+
+  projectList.querySelectorAll('button').forEach((button) => {
+    button.disabled = disabled;
+  });
+}
+
+// Send a request and report unsuccessful HTTP responses.
 async function apiRequest(url, options = {}) {
   const response = await fetch(url, options);
-
   const data = await response.json().catch(() => null);
 
   if (!response.ok) {
@@ -30,8 +43,30 @@ async function apiRequest(url, options = {}) {
   return data;
 }
 
-// Read projects from SQLite through the API.
+// Show the correct list state without confusing a failure with an empty list.
+function updateListState() {
+  if (loading) {
+    emptyState.hidden = false;
+    emptyState.textContent = 'Loading projects...';
+    return;
+  }
+
+  if (loadFailed) {
+    emptyState.hidden = true;
+    return;
+  }
+
+  emptyState.hidden = projects.length > 0;
+  emptyState.textContent = 'No projects added yet.';
+}
+
+// Read the saved projects from the server.
 async function loadProjects() {
+  loading = true;
+  loadFailed = false;
+  updateListState();
+  message.textContent = 'Loading projects...';
+
   try {
     const data = await apiRequest(API_URL);
 
@@ -40,9 +75,20 @@ async function loadProjects() {
     }
 
     projects = data;
+    loadFailed = false;
     renderProjects();
+    message.textContent = projects.length
+      ? 'Projects loaded successfully.'
+      : 'No projects found yet. Add your first project.';
+    return true;
   } catch (error) {
+    loadFailed = true;
     message.textContent = `Could not load projects: ${error.message}`;
+    updateListState();
+    return false;
+  } finally {
+    loading = false;
+    updateListState();
   }
 }
 
@@ -64,15 +110,17 @@ function renderProjects() {
     name.textContent = project.name;
 
     const status = document.createElement('p');
-    status.textContent = 'Status: ' + project.status;
+    status.textContent = `Status: ${project.status}`;
 
     const editButton = document.createElement('button');
     editButton.type = 'button';
     editButton.textContent = 'Edit';
+    editButton.disabled = submitting || deleting;
 
     editButton.addEventListener('click', function () {
-      editingId = project.id;
+      if (submitting || deleting) return;
 
+      editingId = project.id;
       nameInput.value = project.name;
       statusInput.value = project.status;
 
@@ -87,18 +135,20 @@ function renderProjects() {
     const deleteButton = document.createElement('button');
     deleteButton.type = 'button';
     deleteButton.textContent = 'Delete';
+    deleteButton.disabled = submitting || deleting;
 
     deleteButton.addEventListener('click', async function () {
+      if (submitting || deleting) return;
+
       const confirmed = window.confirm(
         `Are you sure you want to delete "${project.name}"?`
       );
 
-      if (!confirmed) {
-        return;
-      }
+      if (!confirmed || submitting || deleting) return;
 
-      deleteButton.disabled = true;
-      message.textContent = '';
+      deleting = true;
+      setMutationControlsDisabled(true);
+      message.textContent = 'Deleting project...';
 
       try {
         await apiRequest(`${API_URL}/${project.id}`, {
@@ -109,30 +159,34 @@ function renderProjects() {
           resetForm();
         }
 
-        await loadProjects();
-        message.textContent = 'Project deleted successfully.';
+        const refreshed = await loadProjects();
+
+        if (refreshed) {
+          message.textContent = 'Project deleted successfully.';
+        } else {
+          message.textContent =
+            'Project deleted, but the project list could not refresh. Reload the page to check the latest list.';
+        }
       } catch (error) {
         message.textContent = `Could not delete project: ${error.message}`;
-        deleteButton.disabled = false;
+      } finally {
+        deleting = false;
+        setMutationControlsDisabled(false);
       }
     });
 
     item.append(name, status, editButton, deleteButton);
-    projectList.appendChild(item);
+    projectList.append(item);
   }
 
-  if (emptyState) {
-    emptyState.hidden = projects.length > 0;
-  }
+  updateListState();
 }
 
 // Create a project or update the selected project.
 form.addEventListener('submit', async function (event) {
   event.preventDefault();
 
-  if (submitting) {
-    return;
-  }
+  if (submitting || deleting) return;
 
   const name = nameInput.value.trim();
   const status = statusInput.value;
@@ -156,52 +210,59 @@ form.addEventListener('submit', async function (event) {
   }
 
   submitting = true;
-  saveButton.disabled = true;
-  message.textContent = '';
+  setMutationControlsDisabled(true);
+  saveButton.textContent = editingId !== null ? 'Saving changes...' : 'Saving...';
+  message.textContent = 'Saving project...';
 
   try {
     const wasEditing = editingId !== null;
+    const url = wasEditing ? `${API_URL}/${editingId}` : API_URL;
 
-    if (wasEditing) {
-      await apiRequest(`${API_URL}/${editingId}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ name, status })
-      });
+    await apiRequest(url, {
+      method: wasEditing ? 'PUT' : 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ name, status })
+    });
+
+    // Reset only after the server confirms that the save succeeded.
+    resetForm();
+
+    const refreshed = await loadProjects();
+
+    if (refreshed) {
+      message.textContent = wasEditing
+        ? 'Project updated and saved successfully.'
+        : 'Project added and saved successfully.';
     } else {
-      await apiRequest(API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ name, status })
-      });
+      message.textContent =
+        'Project saved successfully, but the list could not refresh. Reload the page to check the saved data.';
     }
 
-    resetForm();
-    await loadProjects();
-
-    message.textContent = wasEditing
-      ? 'Project updated and saved.'
-      : 'Project added and saved.';
-
-    nameInput.focus();
+    if (refreshed) {
+      nameInput.focus();
+    }
   } catch (error) {
+    // Do not reset the form: preserve the user's unsaved values.
     message.textContent = `Could not save project: ${error.message}`;
   } finally {
     submitting = false;
-    saveButton.disabled = false;
+    saveButton.textContent = editingId !== null
+      ? 'Save changes'
+      : 'Add Project';
+    setMutationControlsDisabled(false);
   }
 });
 
-// Cancel editing without changing the stored project.
+// Cancel editing without modifying the saved project.
 cancelButton.addEventListener('click', function () {
+  if (submitting || deleting) return;
+
   resetForm();
   message.textContent = 'Edit cancelled.';
   nameInput.focus();
 });
 
-// Load the server's records when the page opens.
+// Load saved projects when the page opens.
 loadProjects();
